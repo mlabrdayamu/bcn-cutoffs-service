@@ -101,6 +101,115 @@ def parse_sheet_csv(sheet_id: str, gid: str) -> List[Dict]:
 
     return out
 
+# --- Parsers específicos CMA y ONE ---
+
+def parse_cma_csv(sheet_id: str, gid: str, pol_filter=("ESBCN", "BARCELONA", "BCN")) -> List[Dict]:
+    """CMA: mapea columnas (Shipping Instructions / Customs Clearance, ETA/ETD…) y filtra a Barcelona."""
+    import csv, io, httpx, re
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
+            r = c.get(url); r.raise_for_status()
+            data = list(csv.reader(io.StringIO(r.content.decode("utf-8", errors="ignore"))))
+    except Exception as e:
+        print(f"[WARN] CMA CSV failed: {e}")
+        return []
+
+    # detecta cabecera
+    header_idx, header = None, []
+    for i, row in enumerate(data[:50]):
+        low = [ (x or "").strip().lower() for x in row ]
+        if any("vessel et" in h for h in low) and any("shipping instructions" in h or h.startswith("si") for h in low):
+            header_idx, header = i, low; break
+    if header_idx is None:
+        header_idx, header = 0, [ (x or "").strip().lower() for x in data[0] ]
+    rows = data[header_idx+1:]
+
+    def col(*pats):
+        for i,h in enumerate(header):
+            for p in pats:
+                if re.search(p, h, flags=re.I): return i
+        return -1
+
+    i_service = col(r"^service")
+    i_voy     = col(r"^voy")
+    i_vessel  = col(r"^vessel(\s|$)")
+    i_pol     = col(r"port of loading")
+    i_eta     = col(r"vessel eta")
+    i_etd     = col(r"vessel etd")
+    i_doc     = col(r"shipping instructions.*cut.?off|\bsi\b.*cut.?off|shipping.*instr")
+    i_desp    = col(r"customs clearance.*cut.?off|customs.*cut.?off")
+    i_term    = col(r"terminal berth")
+
+    out = []
+    for r in rows:
+        v = lambda i: (r[i].strip() if i>=0 and i < len(r) and r[i] else "")
+        pol = v(i_pol).upper()
+        if pol_filter and pol and not any(tok in pol for tok in pol_filter):
+            continue  # solo Barcelona
+        out.append({
+            "service":          v(i_service),
+            "vessel":           v(i_vessel),
+            "voyage":           v(i_voy),
+            "terminal":         v(i_term),
+            "ETD_local":        v(i_etd),
+            "ETA_local":        v(i_eta),
+            "DOC_cutoff":       v(i_doc),
+            "DESPACHO_cutoff":  v(i_desp),
+        })
+    return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
+
+def parse_one_csv(sheet_id: str, gid: str) -> List[Dict]:
+    """ONE: SI BL = DOC, CUSTOMS = DESPACHO, ETA/ETD, VVD=voyage, Vessel Name=vessel."""
+    import csv, io, httpx, re
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
+            r = c.get(url); r.raise_for_status()
+            data = list(csv.reader(io.StringIO(r.content.decode("utf-8", errors="ignore"))))
+    except Exception as e:
+        print(f"[WARN] ONE CSV failed: {e}")
+        return []
+
+    header_idx, header = None, []
+    for i, row in enumerate(data[:30]):
+        low = [ (x or "").strip().lower() for x in row ]
+        if ("vvd" in low or any("vvd" in h for h in low)) and ("si bl" in low or any(("si" in h and "bl" in h) for h in low)):
+            header_idx, header = i, low; break
+    if header_idx is None:
+        header_idx, header = 0, [ (x or "").strip().lower() for x in data[0] ]
+    rows = data[header_idx+1:]
+
+    def col(*pats):
+        for i,h in enumerate(header):
+            for p in pats:
+                if re.search(p, h, flags=re.I): return i
+        return -1
+
+    i_vvd    = col(r"^vvd$|^dep.*voy", r"^voy")
+    i_vessel = col(r"vessel name")
+    i_eta    = col(r"^eta$")
+    i_etd    = col(r"^etd$")
+    i_doc    = col(r"^si\s*bl|shipping.*instr")
+    i_desp   = col(r"^customs$")
+    i_term   = col(r"terminal")
+    i_lane   = col(r"^code$|^lane$")  # opcional
+
+    out = []
+    for r in rows:
+        v = lambda i: (r[i].strip() if i>=0 and i < len(r) and r[i] else "")
+        out.append({
+            "service":          v(i_lane),
+            "vessel":           v(i_vessel),
+            "voyage":           v(i_vvd),
+            "terminal":         v(i_term),
+            "ETD_local":        v(i_etd),
+            "ETA_local":        v(i_eta),
+            "DOC_cutoff":       v(i_doc),
+            "DESPACHO_cutoff":  v(i_desp),
+        })
+    return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
+
 def friday_shift_minus_hours(dt: datetime, hours: int) -> datetime:
     dow = dt.weekday()  # 0=lunes, 6=domingo
     base = dt
@@ -117,44 +226,62 @@ def classify(now: datetime, deadline: datetime|None, buffer_h: int) -> str:
     if diff <= buffer_h: return "AT_RISK"
     return "OK"
 
-def to_dt(s: str) -> datetime|None:
-    if not s: return None
-    for fmt in ("%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M", "%Y-%m-%d", "%d/%m/%Y"):
+def to_dt(s: str, ref: datetime | None = None) -> datetime | None:
+    """Convierte strings tipo '28/08/2025 10H' o '29/08 12:00' en datetime.
+       Si no hay año, usa el de ref o el actual."""
+    if not s:
+        return None
+    txt = str(s).strip()
+
+    # limpia marcadores no-fecha
+    if txt.upper() in {"-", "OMIT", "CLOSED", "TBN", "NA"}:
+        return None
+
+    # 10H -> 10:00
+    txt = re.sub(r"\b(\d{1,2})\s*H\b", r"\1:00", txt, flags=re.I)
+
+    # extrae el trozo de fecha + hora si viene con texto alrededor
+    m = re.search(r"(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?(?:\s+\d{1,2}:\d{2})?)", txt)
+    if m:
+        txt = m.group(1)
+
+    fmts = [
+        "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M",
+        "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y",
+        "%d/%m %H:%M", "%d-%m %H:%M"  # sin año
+    ]
+    for fmt in fmts:
         try:
-            return datetime.strptime(s.strip(), fmt)
+            dt = datetime.strptime(txt, fmt)
+            if "%Y" not in fmt:
+                base_year = (ref.year if ref else datetime.utcnow().year)
+                dt = dt.replace(year=base_year)
+            return dt
         except Exception:
             continue
     return None
 
 # ---------- conectores ----------
 def pull_cma() -> List[Dict]:
-    rows = parse_sheet_csv(*CMA_SHEET)
-    out = []
-    for r in rows:
-        out.append({
-            "carrier":"CMA",
-            **r,
-            "source":"CMA",
-            "source_link": f"https://docs.google.com/spreadsheets/d/{CMA_SHEET[0]}/edit#gid={CMA_SHEET[1]}",
-        })
-    return out
+    rows = parse_cma_csv(*CMA_SHEET, pol_filter=("ESBCN","BARCELONA","BCN"))
+    return [{
+        "carrier":"CMA", **r,
+        "source":"CMA",
+        "source_link": f"https://docs.google.com/spreadsheets/d/{CMA_SHEET[0]}/edit#gid={CMA_SHEET[1]}",
+    } for r in rows]
 
 def pull_one() -> List[Dict]:
-    rows = parse_sheet_csv(*ONE_SHEET)
-    out = []
-    for r in rows:
-        out.append({
-            "carrier":"ONE",
-            **r,
-            "source":"ONE",
-            "source_link": f"https://docs.google.com/spreadsheets/d/{ONE_SHEET[0]}/edit#gid={ONE_SHEET[1]}",
-        })
-    return out
+    rows = parse_one_csv(*ONE_SHEET)
+    return [{
+        "carrier":"ONE", **r,
+        "source":"ONE",
+        "source_link": f"https://docs.google.com/spreadsheets/d/{ONE_SHEET[0]}/edit#gid={ONE_SHEET[1]}",
+    } for r in rows]
 
 def pull_maersk() -> List[Dict]:
     with httpx.Client(follow_redirects=True, timeout=30.0) as c:
         html = c.get(MAERSK_PAGE).text
-    m = re.search(r'https:[^"\']+\\.xlsx', html)
+    m = re.search(r'https:[^"\']+\.xlsx', html)
     if not m: return []
     xurl = m.group(0)
     with httpx.Client(follow_redirects=True, timeout=60.0) as c:
@@ -191,17 +318,7 @@ def pull_maersk() -> List[Dict]:
 # MSC y Hapag requieren Playwright/pdfplumber.
 # Para simplificar, dejamos Hapag por PDF (ETA-24h) y un stub de MSC que
 # probablemente necesite ajustar selectores (lo aviso claramente).
-from playwright.async_api import async_playwright
-import asyncio
-
-MSC_PODS = [  # lista exacta que nos diste
- 'LUANDA','JEDDAH','BUENOS AIRES','YEREVAN','SYDNEY','CHITTAGONG','SANTA CRUZ','PARANAGUA','DAR ES SALAAM','MONTREAL','SANTIAGO',
- 'CAT LAI','DOUALA','SAN ANTONIO','CARTAGENA','BUSAN','SAN JOSE PORT','ABIDJAN','MARIEL','GUAYAQUIL','HOUSTON','MIAMI','BOSTON PORT',
- 'EL SALVADOR','JEBEL ALI','CEBU','POTI','PUERTO CORTES','DADRI','NHAVA SHEBA','MUNDRA PORT','JAKARTA PORT','BASRAH','ASHDOD','MOMBASA',
- 'MONROVIA','SINGAPUR','CASABLANCA','PORT LOUIS','VERACRUZ','KOLKATA','CORINTO','TINCAN','ONNE PORT NIGERIA','HAIFA','CRISTOBAL','MANZANILLO',
- 'ASUNCIÓN','CALLAO PORT','SAN JUAN','DOHA','HAMAD','CAUCEDO','HAINA','DURBAN','SURINAM','MERSIN','TAICHUNG','KEELUNG','RADES','MONTEVIDEO',
- 'PUERTO CABELLO','CHONGQING','QUINGDAO'
-]
+import asyncio  # (se mantiene; no afecta aunque no se use aquí)
 
 async def pull_msc_async() -> List[Dict]:
     try:
@@ -224,7 +341,7 @@ async def pull_msc_async() -> List[Dict]:
 def pull_hapag() -> List[Dict]:
     with httpx.Client(follow_redirects=True, timeout=30.0) as c:
         html = c.get(HAPAG_PAGE).text
-        m = re.search(r'href="(https:[^"]*sailingvesselsBarcelona[^"]*\\.pdf)"', html, flags=re.I)
+        m = re.search(r'href="(https:[^"]*sailingvesselsBarcelona[^"]*\.pdf)"', html, flags=re.I)
         if not m: return []
         pdf_url = m.group(1)
         pdf_bytes = c.get(pdf_url).content
@@ -294,9 +411,10 @@ async def unified(pol: str = "Barcelona"):
     # Normalización y estados
     out = []
     for r in rows:
-        doc  = to_dt(r.get("DOC_cutoff",""))
-        desp = to_dt(r.get("DESPACHO_cutoff","")) if r.get("DESPACHO_cutoff","") else None
-        eta  = to_dt(r.get("ETA_local",""))
+        eta = to_dt(r.get("ETA_local",""))
+        etd = to_dt(r.get("ETD_local",""), ref=eta or datetime.utcnow())
+        doc = to_dt(r.get("DOC_cutoff",""), ref=eta or etd)
+        desp = to_dt(r.get("DESPACHO_cutoff",""), ref=eta or etd)
 
         # Hapag: si no hay despacho explícito → ETA−24h con regla de viernes
         if (not desp) and r.get("carrier","").upper().startswith("HAPAG") and eta:
@@ -313,6 +431,7 @@ async def unified(pol: str = "Barcelona"):
             "status_DESPACHO": st_desp
         })
     return out
-    
+
 @app.get("/health")
-def health(): return {"ok": True}
+def health(): 
+    return {"ok": True}

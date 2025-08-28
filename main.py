@@ -18,14 +18,16 @@ HAPAG_PAGE = "https://www.hapag-lloyd.com/es/services-information/offices-locali
 # ---------- utilidades ----------
 def parse_sheet_csv(sheet_id: str, gid: str) -> List[Dict]:
     """
-    Lee una pestaña pública de Google Sheets en formato CSV y devuelve filas normalizadas
-    con campos comunes. Nunca lanza excepción: si algo falla, retorna [] y escribe un WARN.
+    Lee una pestaña pública de Google Sheets en CSV y devuelve filas con campos comunes.
+    - Detecta la cabecera automáticamente (no asume que esté en la fila 1).
+    - Ignora filas en blanco.
+    - Solo emite filas con algún dato útil.
     """
     import csv, io, re, httpx
 
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
-    # 1) Descarga segura (maneja HTTP≠200 y timeouts)
+    # 1) Descarga segura
     try:
         with httpx.Client(follow_redirects=True, timeout=30.0) as c:
             r = c.get(url)
@@ -37,47 +39,65 @@ def parse_sheet_csv(sheet_id: str, gid: str) -> List[Dict]:
         print(f"[WARN] parse_sheet_csv failed: {e}")
         return []
 
-    # 2) Parseo CSV
-    rows = []
+    # 2) CSV → lista de filas, quitando líneas completamente vacías
     reader = csv.reader(io.StringIO(content))
-    data = list(reader)
-    if not data:
+    rows_raw = [row for row in reader if any((cell or "").strip() for cell in row)]
+    if not rows_raw:
         return []
 
-    headers = [ (h or "").strip().lower() for h in data[0] ]
+    # 3) Localiza la fila de cabecera (buscamos ≥2 patrones conocidos)
+    header_idx = None
+    header = []
+    pats = [r"vessel", r"voy", r"service", r"etd", r"eta", r"doc.*off|instruction", r"customs|despacho"]
+    for i, row in enumerate(rows_raw[:50]):               # miramos las 50 primeras por si hay portada/notas
+        lower = [(cell or "").strip().lower() for cell in row]
+        score = sum(any(re.search(p, h) for h in lower) for p in pats)
+        if score >= 2:
+            header_idx = i
+            header = lower
+            break
+    if header_idx is None:
+        print(f"[WARN] header not found for sheet {sheet_id} gid {gid}")
+        return []
 
-    # Helper para localizar columnas por regex
-    def find(patterns):
-        for i, h in enumerate(headers):
+    data = rows_raw[header_idx + 1:]
+
+    # 4) Helpers de columnas
+    def find(*patterns):
+        for i, h in enumerate(header):
             for p in patterns:
                 if re.search(p, h, flags=re.I):
                     return i
         return -1
 
-    idx_vessel = find([r"^vessel(\s|$)|vessel name"])
-    idx_voyage = find([r"^voy(age)?$|^voy "])
-    idx_service= find([r"^service(\s|$)|service code"])
-    idx_term   = find([r"^terminal$"])
-    idx_etd    = find([r"^etd(\s|$)|etd local|departure"])
-    idx_eta    = find([r"^eta(\s|$)|eta local|arrival"])
-    idx_doc    = find([r"doc.*cut.?off|instruction"])
-    idx_desp   = find([r"customs|despacho"])
+    i_vessel = find(r"^vessel(\s|$)|vessel name")
+    i_voy    = find(r"^voy(age)?$|^voy ")
+    i_srv    = find(r"^service(\s|$)|service code")
+    i_term   = find(r"^terminal$")
+    i_etd    = find(r"^etd(\s|$)|etd local|departure")
+    i_eta    = find(r"^eta(\s|$)|eta local|arrival")
+    i_doc    = find(r"doc.*cut.?off|instruction")
+    i_desp   = find(r"customs|despacho")
 
-    # 3) Construcción robusta de filas (comprueba longitudes)
-    out = []
-    for r in data[1:]:
-        def val(idx):
-            return (r[idx].strip() if (idx >= 0 and idx < len(r) and r[idx] is not None) else "")
-        out.append({
-            "service":           val(idx_service),
-            "vessel":            val(idx_vessel),
-            "voyage":            val(idx_voyage),
-            "terminal":          val(idx_term),
-            "ETD_local":         val(idx_etd),
-            "ETA_local":         val(idx_eta),
-            "DOC_cutoff":        val(idx_doc),
-            "DESPACHO_cutoff":   val(idx_desp),
-        })
+    def val(row, idx):
+        return (row[idx].strip() if (idx >= 0 and idx < len(row) and row[idx] is not None) else "")
+
+    out: List[Dict] = []
+    for r in data:
+        row = {
+            "service":          val(r, i_srv),
+            "vessel":           val(r, i_vessel),
+            "voyage":           val(r, i_voy),
+            "terminal":         val(r, i_term),
+            "ETD_local":        val(r, i_etd),
+            "ETA_local":        val(r, i_eta),
+            "DOC_cutoff":       val(r, i_doc),
+            "DESPACHO_cutoff":  val(r, i_desp),
+        }
+        # 5) Filtro: ignorar filas vacías de verdad
+        if any(row[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"]):
+            out.append(row)
+
     return out
 
 def friday_shift_minus_hours(dt: datetime, hours: int) -> datetime:

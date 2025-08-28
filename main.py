@@ -4,6 +4,7 @@ import httpx, io, re, csv
 import pandas as pd
 import pdfplumber
 from datetime import datetime, timedelta
+ENABLE_MSC = False  # temporal; lo activamos cuando afinemos los selectores
 
 app = FastAPI()
 TZ = "Europe/Madrid"
@@ -203,15 +204,21 @@ MSC_PODS = [  # lista exacta que nos diste
 ]
 
 async def pull_msc_async() -> List[Dict]:
-    rows = []
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(MSC_PAGE, wait_until="domcontentloaded")
-        # IMPORTANTE: Los selectores pueden cambiar. Esto es un esqueleto y puede requerir ajuste.
-        # Devolvemos vacío si no encontramos el widget (lo veremos en los logs).
-        # TODO: ajustar selectores reales de la herramienta de MSC.
-        await browser.close()
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as e:
+        print(f"[WARN] Playwright import failed: {e}")
+        return []
+    rows: List[Dict] = []
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(MSC_PAGE, wait_until="domcontentloaded")
+            # TODO: parseo real de MSC. De momento devolvemos vacío.
+            await browser.close()
+    except Exception as e:
+        print(f"[WARN] MSC scraping failed: {e}")
     return rows
 
 def pull_hapag() -> List[Dict]:
@@ -270,17 +277,21 @@ def _safe(fn, name: str):
 async def unified(pol: str = "Barcelona"):
     now = datetime.utcnow()
     rows: List[Dict] = []
+
+    # Conectores "seguros" (no rompen si fallan)
     rows += _safe(pull_cma, "CMA")
     rows += _safe(pull_one, "ONE")
     rows += _safe(pull_maersk, "MAERSK")
     rows += _safe(pull_hapag, "HAPAG")
 
-    # MSC (Playwright) – mejor esfuerzo, nunca rompe la respuesta
-    try:
-        rows += await pull_msc_async()
-    except Exception as e:
-        print(f"[WARN] MSC failed: {e}")
+    # MSC solo si está habilitado
+    if ENABLE_MSC:
+        try:
+            rows += await pull_msc_async()
+        except Exception as e:
+            print(f"[WARN] MSC failed: {e}")
 
+    # Normalización y estados
     out = []
     for r in rows:
         doc  = to_dt(r.get("DOC_cutoff",""))
@@ -296,10 +307,10 @@ async def unified(pol: str = "Barcelona"):
 
         out.append({
             **r,
-            "DOC_cutoff":       doc.strftime("%Y-%m-%d %H:%M")  if doc  else "",
-            "DESPACHO_cutoff":  desp.strftime("%Y-%m-%d %H:%M") if desp else "",
-            "status_DOC":       st_doc,
-            "status_DESPACHO":  st_desp
+            "DOC_cutoff":      doc.strftime("%Y-%m-%d %H:%M")  if doc  else "",
+            "DESPACHO_cutoff": desp.strftime("%Y-%m-%d %H:%M") if desp else "",
+            "status_DOC":      st_doc,
+            "status_DESPACHO": st_desp
         })
     return out
     

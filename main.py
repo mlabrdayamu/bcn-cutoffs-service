@@ -224,58 +224,120 @@ def parse_cma_csv(sheet_id: str, gid: str) -> List[Dict]:
     return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
 
 def parse_one_csv(sheet_id: str, gid: str) -> List[Dict]:
-    """ONE: 'SI BL' (DOC), 'CUSTOMS' (DESPACHO). Hoja BCN -> forzar pol ESBCN."""
+    """
+    ONE (BCN): la cabecera viene en 2 filas. Este parser:
+    - Fusiona hasta 2 filas de cabecera antes de la 1ª fila que empieza por 'week'.
+    - Mapea: ETA, ETD, 'SI BL' -> DOC, 'CUSTOMS' -> DESPACHO, TERMINAL, VESSEL NAME, VVD/LANE.
+    - Guarda también DOC_text / DESPACHO_text (texto completo).
+    - Esta hoja ya es sólo BCN, así que no filtramos ESBCN.
+    """
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
     try:
         with httpx.Client(follow_redirects=True, timeout=30.0) as c:
             r = c.get(url); r.raise_for_status()
-            data = list(csv.reader(io.StringIO(r.content.decode("utf-8", errors="ignore"))))
+            rows = list(csv.reader(io.StringIO(r.content.decode("utf-8", errors="ignore"))))
     except Exception as e:
         print(f"[WARN] ONE CSV failed: {e}")
         return []
-    if not data: return []
 
-    header_idx, header = None, []
-    for i,row in enumerate(data[:50]):
-        low = [(x or "").strip().lower() for x in row]
-        if ("vessel name" in " ".join(low)) and ("si bl" in " ".join(low)) and ("customs" in " ".join(low)):
-            header_idx, header = i, low; break
-    if header_idx is None:
-        header_idx, header = 0, [(x or "").strip().lower() for x in data[0]]
-    rows = data[header_idx+1:]
+    # Limpia filas totalmente vacías
+    rows = [row for row in rows if any((cell or "").strip() for cell in row)]
+    if not rows:
+        return []
 
-    def col(*p):
-        for i,h in enumerate(header):
-            for pat in p:
-                if re.search(pat,h,flags=re.I): return i
+    # Localiza la primera fila de datos: empieza por 'week'
+    data_idx = None
+    for i, row in enumerate(rows[:80]):
+        first = (row[0] or "").strip().lower()
+        if re.match(r"week\b", first):
+            data_idx = i
+            break
+    if data_idx is None:
+        print("[WARN] ONE data start not found (no 'week')")
+        return []
+
+    # Fusiona hasta 2 filas de cabecera anteriores a data_idx
+    start = max(0, data_idx - 2)
+    header_rows = rows[start:data_idx]
+    maxlen = max(len(r) for r in header_rows) if header_rows else 0
+    header: List[str] = []
+    for j in range(maxlen):
+        parts = []
+        for hr in header_rows:
+            if j < len(hr) and (hr[j] or "").strip():
+                parts.append(str(hr[j]).strip())
+        h = " ".join(parts).strip().lower()
+        h = re.sub(r"\s+", " ", h)
+        header.append(h)
+
+    data = rows[data_idx:]
+
+    def col(*pats):
+        for i, h in enumerate(header):
+            for p in pats:
+                if re.search(p, h, flags=re.I):
+                    return i
         return -1
 
-    i_vvd    = col(r"^vvd$|^dep.*voy|^voy")
-    i_vessel = col(r"vessel name")
-    i_eta    = col(r"^eta$")
-    i_etd    = col(r"^etd$")
-    i_doc    = col(r"^si\s*bl|shipping.*instr")
-    i_desp   = col(r"^customs$")
-    i_term   = col(r"terminal")
-    i_lane   = col(r"^code$|^lane$")
+    # Índices (tolerantes)
+    i_vessel = col(r"vessel name|^vessel\b")
+    i_vvd    = col(r"\bvvd\b|dep.*voy|^code\b")
+    i_lane   = col(r"\blane\b")
+    i_eta    = col(r"\beta\b")
+    i_etd    = col(r"\betd\b")
+    i_term   = col(r"\bterminal\b")
+    # SI BL (puede venir como 'si bl' o 'shipping instructions')
+    i_doc    = col(r"\bsi\s*bl\b|shipping.*instr")
+    # CUSTOMS: en ONE hay grupo 'CUSTOMS DATA', 'CUSTOMS VOYAGE NUMBER', etc.;
+    # prioriza una columna cuyo encabezado sea exactamente 'customs'
+    i_desp = -1
+    for idx, h in enumerate(header):
+        hc = re.sub(r"\s+", " ", h).strip()
+        if hc == "customs":
+            i_desp = idx
+            break
+    if i_desp < 0:
+        # si no existe exacto, toma la primera que contenga 'customs' pero no 'voyage'/'number'/'open'/'data'
+        for idx, h in enumerate(header):
+            if ("customs" in h) and not any(x in h for x in ["voyage", "number", "open", "data"]):
+                i_desp = idx
+                break
 
     out: List[Dict] = []
-    for r in rows:
-        v = lambda i: (r[i].strip() if i>=0 and i<len(r) and r[i] else "")
+    for r in data:
+        # Filtra filas que no son datos (por si quedan notas)
+        if not (r and (r[0] or "").strip().lower().startswith("week")):
+            continue
+
+        def v(i): return (r[i].strip() if i >= 0 and i < len(r) and r[i] else "")
+
+        vessel = v(i_vessel)
+        vvd    = v(i_vvd)
+        lane   = v(i_lane)
+        eta    = v(i_eta)
+        etd    = v(i_etd)
+        term   = v(i_term)
+        doc_txt  = v(i_doc)
+        desp_txt = v(i_desp)
+
         out.append({
-            "service":          v(i_lane),
-            "vessel":           v(i_vessel),
-            "voyage":           v(i_vvd),
-            "terminal":         v(i_term),
-            "ETD_local":        v(i_etd),
-            "ETA_local":        v(i_eta),
-            "DOC_cutoff":       v(i_doc),
-            "DESPACHO_cutoff":  v(i_desp),
-            "DOC_text":         v(i_doc),   # <-- texto original completo
-            "DESPACHO_text":    v(i_desp),  # <-- texto original completo
-            "pol":              "ESBCN",
+            "service":          lane or vvd,   # usamos Lane, si no VVD
+            "vessel":           vessel,
+            "voyage":           vvd,
+            "terminal":         term,
+            "ETD_local":        etd,
+            "ETA_local":        eta,
+            "DOC_cutoff":       doc_txt,       # lo normalizamos luego con to_dt()
+            "DESPACHO_cutoff":  desp_txt,
+            "DOC_text":         doc_txt,       # texto completo (por si hay varias horas)
+            "DESPACHO_text":    desp_txt,      # texto completo
+            "pol":              "ESBCN",       # hoja exclusiva BCN
         })
-    return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
+
+    # Mantén sólo filas con algo útil
+    return [x for x in out if any(x[k] for k in [
+        "vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"
+    ])]
 
 # ---------- conectores ----------
 

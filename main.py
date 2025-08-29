@@ -4,6 +4,7 @@ import httpx, io, re, csv
 import pandas as pd
 import pdfplumber
 from datetime import datetime, timedelta
+import asyncio
 
 ENABLE_MSC = False  # MSC desactivado hasta afinar selectores
 
@@ -19,188 +20,18 @@ HAPAG_PAGE = "https://www.hapag-lloyd.com/es/services-information/offices-locali
 
 # ---------- utilidades ----------
 
-BCN_TOKENS = ("ESBCN", "BARCELONA", "BCN")
-
-def is_bcn(txt: str) -> bool:
-    if not txt: return False
-    u = str(txt).upper()
-    return any(tok in u for tok in BCN_TOKENS)
-
-def parse_sheet_csv(sheet_id: str, gid: str) -> List[Dict]:
-    """Parser genérico de Google Sheet (detecta cabecera, filtra vacíos)."""
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-    try:
-        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
-            r = c.get(url)
-            if r.status_code != 200:
-                print(f"[WARN] sheet {sheet_id} gid {gid} -> HTTP {r.status_code}")
-                return []
-            content = r.content.decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"[WARN] parse_sheet_csv failed: {e}")
-        return []
-
-    reader = csv.reader(io.StringIO(content))
-    rows_raw = [row for row in reader if any((cell or "").strip() for cell in row)]
-    if not rows_raw: return []
-
-    # localizar cabecera (≥2 patrones)
-    header_idx, header = None, []
-    pats = [r"vessel", r"\bvoy", r"service", r"\betd\b", r"\beta\b",
-            r"doc.*off|instruction|\bsi\b|shipping.*instr",
-            r"customs|aduan|despach|\bdue\b"]
-    for i,row in enumerate(rows_raw[:50]):
-        lower = [(cell or "").strip().lower() for cell in row]
-        score = sum(any(re.search(p,h) for h in lower) for p in pats)
-        if score >= 2: header_idx, header = i, lower; break
-    if header_idx is None: return []
-
-    data = rows_raw[header_idx+1:]
-
-    def find(*patterns):
-        for i,h in enumerate(header):
-            for p in patterns:
-                if re.search(p,h,flags=re.I): return i
-        return -1
-
-    i_vessel = find(r"^vessel(\s|$)|vessel name")
-    i_voy    = find(r"^voy(age)?$|^voy ")
-    i_srv    = find(r"^service(\s|$)|service code")
-    i_term   = find(r"^terminal$")
-    i_etd    = find(r"^etd(\s|$)|etd.*barcelona|departure")
-    i_eta    = find(r"^eta(\s|$)|eta.*barcelona|arrival")
-    i_doc    = find(r"doc.*cut.?off|instruction|\bsi\b|shipping.*instr")
-    i_desp   = find(r"customs|aduan|despach|\bdue\b")
-
-    def val(row, idx): return (row[idx].strip() if idx>=0 and idx<len(row) and row[idx] else "")
-
-    out: List[Dict] = []
-    for r in data:
-        row = {
-            "service":          val(r, i_srv),
-            "vessel":           val(r, i_vessel),
-            "voyage":           val(r, i_voy),
-            "terminal":         val(r, i_term),
-            "ETD_local":        val(r, i_etd),
-            "ETA_local":        val(r, i_eta),
-            "DOC_cutoff":       val(r, i_doc),
-            "DESPACHO_cutoff":  val(r, i_desp),
-        }
-        if any(row[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"]):
-            out.append(row)
-    return out
-
-def parse_cma_csv(sheet_id: str, gid: str) -> List[Dict]:
-    """CMA: mapea 'SHIPPING INSTRUCTIONS CUT OFF*' → DOC y 'CUSTOMS CLEARANCE CUT OFF*' → DESPACHO.
-       Filtra POL Barcelona."""
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-    try:
-        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
-            r = c.get(url); r.raise_for_status()
-            data = list(csv.reader(io.StringIO(r.content.decode("utf-8", errors="ignore"))))
-    except Exception as e:
-        print(f"[WARN] CMA CSV failed: {e}")
-        return []
-
-    header_idx, header = None, []
-    for i,row in enumerate(data[:50]):
-        low = [(x or "").strip().lower() for x in row]
-        if any("vessel eta" in h for h in low) and any("shipping instructions" in h or h.startswith("si") for h in low):
-            header_idx, header = i, low; break
-    if header_idx is None:
-        header_idx, header = 0, [(x or "").strip().lower() for x in data[0]]
-    rows = data[header_idx+1:]
-
-    def col(*p):
-        for i,h in enumerate(header):
-            for pat in p:
-                if re.search(pat,h,flags=re.I): return i
-        return -1
-
-    i_service = col(r"^service")
-    i_voy     = col(r"^voy")
-    i_vessel  = col(r"^vessel(\s|$)")
-    i_pol     = col(r"port of loading")
-    i_eta     = col(r"vessel eta")
-    i_etd     = col(r"vessel etd")
-    i_doc     = col(r"shipping instructions.*cut.?off|\bsi\b.*cut.?off|shipping.*instr")
-    i_desp    = col(r"customs clearance.*cut.?off|customs.*cut.?off")
-    i_term    = col(r"terminal berth")
-
-    out = []
-    for r in rows:
-        v = lambda i: (r[i].strip() if i>=0 and i<len(r) and r[i] else "")
-        pol = v(i_pol)
-        if pol and not is_bcn(pol):    # <<< SOLO Barcelona
-            continue
-        out.append({
-            "service":          v(i_service),
-            "vessel":           v(i_vessel),
-            "voyage":           v(i_voy),
-            "terminal":         v(i_term),
-            "ETD_local":        v(i_etd),
-            "ETA_local":        v(i_eta),
-            "DOC_cutoff":       v(i_doc),
-            "DESPACHO_cutoff":  v(i_desp),
-        })
-    return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
-
-def parse_one_csv(sheet_id: str, gid: str) -> List[Dict]:
-    """ONE: 'SI BL' → DOC, 'CUSTOMS' → DESPACHO. (Hoja específica BCN)"""
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-    try:
-        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
-            r = c.get(url); r.raise_for_status()
-            data = list(csv.reader(io.StringIO(r.content.decode("utf-8", errors="ignore"))))
-    except Exception as e:
-        print(f"[WARN] ONE CSV failed: {e}")
-        return []
-
-    header_idx, header = None, []
-    for i,row in enumerate(data[:40]):
-        low = [(x or "").strip().lower() for x in row]
-        if ("vessel name" in " ".join(low)) and ("si bl" in " ".join(low)) and ("customs" in " ".join(low)):
-            header_idx, header = i, low; break
-    if header_idx is None:
-        header_idx, header = 0, [(x or "").strip().lower() for x in data[0]]
-    rows = data[header_idx+1:]
-
-    def col(*p):
-        for i,h in enumerate(header):
-            for pat in p:
-                if re.search(pat,h,flags=re.I): return i
-        return -1
-
-    i_vvd    = col(r"^vvd$|^dep.*voy|^voy")
-    i_vessel = col(r"vessel name")
-    i_eta    = col(r"^eta$")
-    i_etd    = col(r"^etd$")
-    i_doc    = col(r"^si\s*bl|shipping.*instr")
-    i_desp   = col(r"^customs$")
-    i_term   = col(r"terminal")
-    i_lane   = col(r"^code$|^lane$")
-
-    out = []
-    for r in rows:
-        v = lambda i: (r[i].strip() if i>=0 and i<len(r) and r[i] else "")
-        out.append({
-            "service":          v(i_lane),
-            "vessel":           v(i_vessel),
-            "voyage":           v(i_vvd),
-            "terminal":         v(i_term),
-            "ETD_local":        v(i_etd),
-            "ETA_local":        v(i_eta),
-            "DOC_cutoff":       v(i_doc),
-            "DESPACHO_cutoff":  v(i_desp),
-        })
-    return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
+def is_esbcn(s: str) -> bool:
+    """Devuelve True sólo si el código empieza por ESBCN (ignora espacios)."""
+    if not s: return False
+    u = re.sub(r"\s+", "", str(s).upper())
+    return u.startswith("ESBCN")
 
 def friday_shift_minus_hours(dt: datetime, hours: int) -> datetime:
     dow = dt.weekday()  # 0=lunes, 6=domingo
     base = dt
-    if dow == 5:  # sábado => viernes
+    if dow == 5:   # sábado -> viernes
         base = dt - timedelta(days=1)
-    elif dow == 6:  # domingo => viernes
+    elif dow == 6: # domingo -> viernes
         base = dt - timedelta(days=2)
     return base - timedelta(hours=hours)
 
@@ -235,10 +66,144 @@ def to_dt(s: str, ref: datetime | None = None) -> datetime | None:
             continue
     return None
 
+# ---------- parsers Sheets ----------
+
+def parse_sheet_csv(sheet_id: str, gid: str) -> List[Dict]:
+    """Parser genérico (detecta cabecera, filtra vacíos)."""
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
+            r = c.get(url); r.raise_for_status()
+            content = r.content.decode("utf-8", errors="ignore")
+    except Exception as e:
+        print(f"[WARN] parse_sheet_csv failed: {e}")
+        return []
+    reader = csv.reader(io.StringIO(content))
+    rows_raw = [row for row in reader if any((cell or "").strip() for cell in row)]
+    if not rows_raw: return []
+
+    header_idx, header = None, []
+    pats = [r"vessel", r"\bvoy", r"service", r"\betd\b", r"\beta\b",
+            r"doc.*off|instruction|\bsi\b|shipping.*instr", r"customs|aduan|despach|\bdue\b", r"port of loading|pol"]
+    for i,row in enumerate(rows_raw[:50]):
+        lower = [(cell or "").strip().lower() for cell in row]
+        score = sum(any(re.search(p,h) for h in lower) for p in pats)
+        if score >= 2: header_idx, header = i, lower; break
+    if header_idx is None: return []
+    data = rows_raw[header_idx+1:]
+
+    def find(*patterns):
+        for i,h in enumerate(header):
+            for p in patterns:
+                if re.search(p,h,flags=re.I): return i
+        return -1
+
+    i_vessel = find(r"^vessel(\s|$)|vessel name")
+    i_voy    = find(r"^voy(age)?$|^voy ")
+    i_srv    = find(r"^service(\s|$)|service code")
+    i_term   = find(r"^terminal|terminal berth")
+    i_etd    = find(r"^etd(\s|$)|etd.*barcelona|departure")
+    i_eta    = find(r"^eta(\s|$)|eta.*barcelona|arrival")
+    i_doc    = find(r"doc.*cut.?off|instruction|\bsi\b|shipping.*instr")
+    i_desp   = find(r"customs|aduan|despach|\bdue\b")
+    i_pol    = find(r"port of loading|^pol$|origin")
+
+    def val(row, idx): return (row[idx].strip() if idx>=0 and idx<len(row) and row[idx] else "")
+
+    out: List[Dict] = []
+    for r in data:
+        row = {
+            "service":          val(r, i_srv),
+            "vessel":           val(r, i_vessel),
+            "voyage":           val(r, i_voy),
+            "terminal":         val(r, i_term),
+            "ETD_local":        val(r, i_etd),
+            "ETA_local":        val(r, i_eta),
+            "DOC_cutoff":       val(r, i_doc),
+            "DESPACHO_cutoff":  val(r, i_desp),
+            "pol":              val(r, i_pol),
+        }
+        if any(row[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff","pol"]):
+            out.append(row)
+    return out
+
+def parse_cma_csv(sheet_id: str, gid: str) -> List[Dict]:
+    """CMA: mapea columnas y filtra ESBCN (POL o terminal)."""
+    rows = parse_sheet_csv(sheet_id, gid)
+    out = []
+    for r in rows:
+        pol = r.get("pol","")
+        term = r.get("terminal","")
+        if not (is_esbcn(pol) or is_esbcn(term)):
+            continue
+        out.append({
+            "service": r.get("service",""),
+            "vessel":  r.get("vessel",""),
+            "voyage":  r.get("voyage",""),
+            "terminal":r.get("terminal",""),
+            "ETD_local":r.get("ETD_local",""),
+            "ETA_local":r.get("ETA_local",""),
+            "DOC_cutoff":r.get("DOC_cutoff",""),
+            "DESPACHO_cutoff":r.get("DESPACHO_cutoff",""),
+            "pol": pol or term
+        })
+    return out
+
+def parse_one_csv(sheet_id: str, gid: str) -> List[Dict]:
+    """ONE: 'SI BL' (DOC), 'CUSTOMS' (DESPACHO). Hoja BCN -> forzar pol ESBCN."""
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
+            r = c.get(url); r.raise_for_status()
+            data = list(csv.reader(io.StringIO(r.content.decode("utf-8", errors="ignore"))))
+    except Exception as e:
+        print(f"[WARN] ONE CSV failed: {e}")
+        return []
+    header_idx, header = None, []
+    for i,row in enumerate(data[:50]):
+        low = [(x or "").strip().lower() for x in row]
+        if ("vessel name" in " ".join(low)) and ("si bl" in " ".join(low)) and ("customs" in " ".join(low)):
+            header_idx, header = i, low; break
+    if header_idx is None:
+        header_idx, header = 0, [(x or "").strip().lower() for x in data[0]]
+    rows = data[header_idx+1:]
+
+    def col(*p):
+        for i,h in enumerate(header):
+            for pat in p:
+                if re.search(pat,h,flags=re.I): return i
+        return -1
+
+    i_vvd    = col(r"^vvd$|^dep.*voy|^voy")
+    i_vessel = col(r"vessel name")
+    i_eta    = col(r"^eta$")
+    i_etd    = col(r"^etd$")
+    i_doc    = col(r"^si\s*bl|shipping.*instr")
+    i_desp   = col(r"^customs$")
+    i_term   = col(r"terminal")
+    i_lane   = col(r"^code$|^lane$")
+
+    out: List[Dict] = []
+    for r in rows:
+        v = lambda i: (r[i].strip() if i>=0 and i<len(r) and r[i] else "")
+        out.append({
+            "service":          v(i_lane),
+            "vessel":           v(i_vessel),
+            "voyage":           v(i_vvd),
+            "terminal":         v(i_term),
+            "ETD_local":        v(i_etd),
+            "ETA_local":        v(i_eta),
+            "DOC_cutoff":       v(i_doc),
+            "DESPACHO_cutoff":  v(i_desp),
+            "pol":              "ESBCN"
+        })
+    # filtra vacíos reales
+    return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
+
 # ---------- conectores ----------
 
 def pull_cma() -> List[Dict]:
-    rows = parse_cma_csv(*CMA_SHEET)  # ya filtra ESBCN
+    rows = parse_cma_csv(*CMA_SHEET)
     return [{
         "carrier":"CMA", **r,
         "source":"CMA",
@@ -246,23 +211,40 @@ def pull_cma() -> List[Dict]:
     } for r in rows]
 
 def pull_one() -> List[Dict]:
-    rows = parse_one_csv(*ONE_SHEET)  # la hoja es específica BCN
+    rows = parse_one_csv(*ONE_SHEET)
     return [{
         "carrier":"ONE", **r,
         "source":"ONE",
         "source_link": f"https://docs.google.com/spreadsheets/d/{ONE_SHEET[0]}/edit#gid={ONE_SHEET[1]}",
     } for r in rows]
 
+def httpx_get_with_retry(url: str, timeout: float = 60.0, attempts: int = 3) -> httpx.Response:
+    last = None
+    for i in range(attempts):
+        try:
+            with httpx.Client(follow_redirects=True, timeout=timeout) as c:
+                return c.get(url)
+        except Exception as e:
+            last = e
+    raise last if last else RuntimeError("request failed")
+
 def pull_maersk() -> List[Dict]:
-    with httpx.Client(follow_redirects=True, timeout=30.0) as c:
-        html = c.get(MAERSK_PAGE).text
-    m = re.search(r'https:[^"\']+\.xlsx', html)
-    if not m: 
+    try:
+        html = httpx_get_with_retry(MAERSK_PAGE, timeout=60.0).text
+    except Exception as e:
+        print(f"[WARN] MAERSK failed: {e}")
+        return []
+    # link al xlsx (cualquier .xlsx)
+    m = re.search(r'https://[^"\']+\.xlsx', html)
+    if not m:
         print("[WARN] MAERSK xlsx link not found")
         return []
     xurl = m.group(0)
-    with httpx.Client(follow_redirects=True, timeout=60.0) as c:
-        xbytes = c.get(xurl).content
+    try:
+        xbytes = httpx_get_with_retry(xurl, timeout=90.0).content
+    except Exception as e:
+        print(f"[WARN] MAERSK failed: {e}")
+        return []
     df = pd.read_excel(io.BytesIO(xbytes))
 
     cols = {str(k).strip().lower(): k for k in df.columns}
@@ -271,7 +253,6 @@ def pull_maersk() -> List[Dict]:
             if n in cols: return cols[n]
         return None
 
-    # columnas posibles
     vcol = get("vessel","vessel name")
     ycol = get("voyage","voy")
     scol = get("service","service code")
@@ -286,26 +267,24 @@ def pull_maersk() -> List[Dict]:
     out = []
     for _,r in df.iterrows():
         pol_val = str(r.get(polc,"") or "")
-        if polc and pol_val and not is_bcn(pol_val):
-            continue  # <<< SOLO Barcelona
+        term_val = str(r.get(tcol,"") or "")
+        if not (is_esbcn(pol_val) or is_esbcn(term_val)):
+            continue  # SOLO ESBCN
         out.append({
             "carrier":"MAERSK",
             "service": str(r.get(scol,"") or ""),
             "vessel":  str(r.get(vcol,"") or ""),
             "voyage":  str(r.get(ycol,"") or ""),
-            "terminal":str(r.get(tcol,"") or ""),
+            "terminal":term_val,
             "ETD_local": str(r.get(etd,"") or ""),
             "ETA_local": str(r.get(eta,"") or ""),
             "DOC_cutoff": str(r.get(doc_cols[0],"") if doc_cols else ""),
             "DESPACHO_cutoff": str(r.get(desp_cols[0],"") if desp_cols else ""),
+            "pol": pol_val,
             "source":"MAERSK",
             "source_link": MAERSK_PAGE
         })
-    # filtra filas vacías reales
-    out = [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
-    return out
-
-import asyncio  # MSC se mantiene desactivado
+    return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
 
 async def pull_msc_async() -> List[Dict]:
     try:
@@ -319,22 +298,38 @@ async def pull_msc_async() -> List[Dict]:
             browser = await pw.chromium.launch(headless=True)
             page = await browser.new_page()
             await page.goto(MSC_PAGE, wait_until="domcontentloaded")
-            # TODO: scraping real; por ahora vacío
             await browser.close()
     except Exception as e:
         print(f"[WARN] MSC scraping failed: {e}")
     return rows
 
 def pull_hapag() -> List[Dict]:
-    # El PDF que usamos ya es específico Barcelona
-    with httpx.Client(follow_redirects=True, timeout=30.0) as c:
-        html = c.get(HAPAG_PAGE).text
-        m = re.search(r'href="(https:[^"]*sailingvesselsBarcelona[^"]*\.pdf)"', html, flags=re.I)
-        if not m: 
-            print("[WARN] HAPAG pdf link not found")
-            return []
-        pdf_url = m.group(1)
-        pdf_bytes = c.get(pdf_url).content
+    try:
+        html = httpx_get_with_retry(HAPAG_PAGE, timeout=30.0).text
+    except Exception as e:
+        print(f"[WARN] HAPAG page failed: {e}")
+        return []
+    # buscar cualquier PDF que contenga 'barcelona'
+    m = re.search(r'href="([^"]+\.pdf[^"]*)"', html, flags=re.I)
+    pdf_url = None
+    if m:
+        cand = m.group(1)
+        if "barcelona" in cand.lower():
+            pdf_url = cand
+    if not pdf_url:
+        cands = re.findall(r'href="([^"]+\.pdf[^"]*)"', html, flags=re.I)
+        for u in cands:
+            if "barcelona" in u.lower():
+                pdf_url = u; break
+    if not pdf_url:
+        print("[WARN] HAPAG pdf link not found")
+        return []
+    try:
+        pdf_bytes = httpx_get_with_retry(pdf_url, timeout=60.0).content
+    except Exception as e:
+        print(f"[WARN] HAPAG pdf download failed: {e}")
+        return []
+
     out = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
@@ -350,7 +345,7 @@ def pull_hapag() -> List[Dict]:
                 i_vessel = find("vessel","vessel name")
                 i_voy    = find("voyage","voy")
                 i_srv    = find("service")
-                i_term   = find("terminal")
+                i_term   = find("terminal","terminal berth")
                 i_etd    = find("etd","departure","etd local")
                 i_eta    = find("eta","arrival","eta local")
                 for r in tbl[1:]:
@@ -364,8 +359,9 @@ def pull_hapag() -> List[Dict]:
                         "terminal": (r[i_term] if i_term>=0 else "") or "",
                         "ETD_local": (r[i_etd] if i_etd>=0 else "") or "",
                         "ETA_local": (r[i_eta] if i_eta>=0 else "") or "",
-                        "DOC_cutoff": "",          # no lo publican
-                        "DESPACHO_cutoff": "",     # se calcula por fallback en unified
+                        "DOC_cutoff": "",
+                        "DESPACHO_cutoff": "",
+                        "pol": "ESBCN",
                         "source":"HAPAG",
                         "source_link": HAPAG_PAGE
                     })
@@ -396,21 +392,20 @@ async def unified(pol: str = "Barcelona"):
         except Exception as e:
             print(f"[WARN] MSC failed: {e}")
 
-    # Normaliza + estados
+    # Filtro FINAL: sólo filas con pol o terminal que empiece por ESBCN
+    rows = [r for r in rows if is_esbcn(r.get("pol","")) or is_esbcn(r.get("terminal",""))]
+
+    # Normalización + estados
     out = []
     for r in rows:
         eta  = to_dt(r.get("ETA_local",""))
         etd  = to_dt(r.get("ETD_local",""), ref=eta or datetime.utcnow())
         doc  = to_dt(r.get("DOC_cutoff",""),       ref=eta or etd)
         desp = to_dt(r.get("DESPACHO_cutoff",""),  ref=eta or etd)
-
-        # Hapag: si no viene despacho explícito => ETA-24h con regla de viernes
         if (not desp) and r.get("carrier","").upper().startswith("HAPAG") and eta:
             desp = friday_shift_minus_hours(eta, 24)
-
         st_doc  = classify(now, doc, 36)
         st_desp = classify(now, desp, 24)
-
         out.append({
             **r,
             "DOC_cutoff":      doc.strftime("%Y-%m-%d %H:%M")  if doc  else "",

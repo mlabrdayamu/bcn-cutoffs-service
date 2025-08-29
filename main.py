@@ -148,7 +148,8 @@ def parse_sheet_csv(sheet_id: str, gid: str) -> List[Dict]:
     return out
 
 def parse_cma_csv(sheet_id: str, gid: str) -> List[Dict]:
-    """CMA: mapea cabeceras exactas y filtra SOLO ESBCN (POL o Terminal Berth)."""
+    """CMA: mapea cabeceras y filtra SOLO ESBCN (POL o Terminal Berth).
+       Patrones flexibles para SI/DESPACHO (acepta comillas/asteriscos)."""
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
     try:
         with httpx.Client(follow_redirects=True, timeout=30.0) as c:
@@ -157,40 +158,51 @@ def parse_cma_csv(sheet_id: str, gid: str) -> List[Dict]:
     except Exception as e:
         print(f"[WARN] CMA CSV failed: {e}")
         return []
-    if not data: return []
+    if not data:
+        return []
 
-    # Detecta cabecera (por 'Vessel ETA' y 'Shipping Instructions')
+    # Localiza una fila de cabecera que contenga 'vessel eta' y 'shipping instructions'
     header_idx, header = None, []
     for i, row in enumerate(data[:50]):
         low = [(x or "").strip().lower() for x in row]
         if ("vessel eta" in " ".join(low)) and ("shipping instructions" in " ".join(low)):
-            header_idx, header = i, low; break
+            header_idx, header = i, low
+            break
     if header_idx is None:
         header_idx, header = 0, [(x or "").strip().lower() for x in data[0]]
-    rows = data[header_idx+1:]
+    rows = data[header_idx + 1:]
 
+    # Buscador de columna: permite comillas y espacios antes del texto clave
     def col(*pats):
-        for i,h in enumerate(header):
+        for i, h in enumerate(header):
             for p in pats:
-                if re.search(p,h,flags=re.I): return i
+                if re.search(p, h, flags=re.I):
+                    return i
         return -1
 
-    i_srv    = col(r"^service\b")
-    i_voy    = col(r"^voyage\b|^voy\b")
+    # Patrones más robustos (sin ^, aceptan comillas/espacios/asteriscos)
+    i_srv    = col(r"\bservice\b")
+    i_voy    = col(r"\bvoyage\b|\bvoy\b")
     i_vessel = col(r"^vessel\b")
-    i_pol    = col(r"^port of loading\b")
-    i_eta    = col(r"^vessel eta\b")
-    i_etd    = col(r"^vessel etd\b")
-    i_doc    = col(r"^shipping instructions cut off")   # DOC
-    i_desp   = col(r"^customs clearance cut off")       # DESPACHO
-    i_term   = col(r"^terminal berth\b")
+    i_pol    = col(r"\bport of loading\b")
+    i_eta    = col(r"\bvessel\s*eta\b|\beta\b")
+    i_etd    = col(r"\bvessel\s*etd\b|\betd\b")
+    i_doc    = col(r'["\s]*shipping\s*instructions\s*cut\s*off')      # DOC (SI)
+    i_desp   = col(r'["\s]*customs\s*clearance\s*cut\s*off')          # DESPACHO
+    i_term   = col(r"\bterminal\s*berth\b|\bterminal\b")
+
+    # Si no detecta DESPACHO, intenta un fallback por posición (suele ir a la derecha de SI)
+    if i_desp < 0 and i_doc >= 0:
+        if i_doc + 1 < len(header):
+            i_desp = i_doc + 1
 
     out: List[Dict] = []
     for r in rows:
-        v = lambda i: (r[i].strip() if i>=0 and i<len(r) and r[i] else "")
+        v = lambda i: (r[i].strip() if i >= 0 and i < len(r) and r[i] else "")
         pol  = v(i_pol)
         term = v(i_term)
-        # Sólo ESBCN (POL o Terminal)
+
+        # SOLO ESBCN: por POL o por Terminal
         if not (pol.upper().startswith("ESBCN") or term.upper().startswith("ESBCN")):
             continue
 
@@ -203,10 +215,12 @@ def parse_cma_csv(sheet_id: str, gid: str) -> List[Dict]:
             "ETA_local":        v(i_eta),
             "DOC_cutoff":       v(i_doc),
             "DESPACHO_cutoff":  v(i_desp),
-            "DOC_text":         v(i_doc),   # <-- texto original completo
-            "DESPACHO_text":    v(i_desp),  # <-- texto original completo
+            "DOC_text":         v(i_doc),    # texto original completo (con dos fechas, CCAM, etc.)
+            "DESPACHO_text":    v(i_desp),   # texto original completo
             "pol":              pol or term,
         })
+
+    # Quita filas totalmente vacías
     return [x for x in out if any(x[k] for k in ["vessel","voyage","ETD_local","ETA_local","DOC_cutoff","DESPACHO_cutoff"])]
 
 def parse_one_csv(sheet_id: str, gid: str) -> List[Dict]:
